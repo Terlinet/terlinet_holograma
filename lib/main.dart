@@ -3,6 +3,7 @@ import 'package:camera/camera.dart';
 import 'dart:async';
 import 'dart:ui' as ui;
 import 'dart:typed_data';
+import 'dart:math' as math;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,120 +35,70 @@ class _HologramHomeState extends State<HologramHome> with SingleTickerProviderSt
   CameraController? _controller;
   bool _isProcessing = false;
   List<Offset> _silhouettePoints = [];
-  late AnimationController _scanController;
+  late AnimationController _uiController;
   Size _imageSize = Size.zero;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    _scanController = AnimationController(
+    _uiController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 3),
+      duration: const Duration(seconds: 5),
     )..repeat();
 
-    // Inicializa a câmera após o build inicial
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _initCamera();
-    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _initCamera());
   }
 
   Future<void> _initCamera() async {
     try {
       final cameras = await availableCameras();
       if (cameras.isEmpty) {
-        setState(() {
-          _errorMessage = "Não há câmeras instaladas ou a câmera está indisponível.";
-        });
+        setState(() => _errorMessage = "Não há câmeras instaladas ou a câmera está indisponível.");
         return;
       }
 
-      // Procura a câmera frontal, se não achar usa a primeira
       final camera = cameras.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.front,
         orElse: () => cameras.first,
       );
 
-      _controller = CameraController(
-        camera,
-        ResolutionPreset.medium,
-        enableAudio: false,
-      );
-
+      _controller = CameraController(camera, ResolutionPreset.medium, enableAudio: false);
       await _controller!.initialize();
 
-      // No Web, o startImageStream pode não ser suportado em todos os browsers
-      // Para o holograma funcionar, vamos tentar iniciar o stream
-      try {
-        _controller!.startImageStream((CameraImage image) {
-          if (_isProcessing) return;
-          _isProcessing = true;
-          _processImage(image);
-        });
-      } catch (e) {
-        debugPrint("Stream não suportado nesta plataforma: $e");
-        // Fallback para Web se necessário: usar timer para capturar frames estáticos
-        _startWebFallback();
-      }
-
+      _controller!.startImageStream((image) {
+        if (_isProcessing) return;
+        _isProcessing = true;
+        _processImage(image);
+      });
     } catch (e) {
       if (mounted) {
-        setState(() {
-          if (e.toString().contains('cameraNotFound')) {
-            _errorMessage = "Não há câmeras instaladas ou a câmera está indisponível.";
-          } else {
-            _errorMessage = "Não conseguimos acessar sua câmera. Verifique as permissões do seu navegador.";
-          }
-        });
+        setState(() => _errorMessage = "Erro de conexão neural: Câmera indisponível.");
       }
     }
-
-    if (mounted) setState(() {});
   }
 
-  void _startWebFallback() {
-    // Se o stream falhar (comum na Web), simulamos uma nuvem de pontos dinâmica
-    // para garantir que o visual do holograma apareça.
-    Timer.periodic(const Duration(milliseconds: 100), (timer) {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-      if (_silhouettePoints.isEmpty) {
-        setState(() {
-          _imageSize = const Size(640, 480);
-          _silhouettePoints = List.generate(300, (index) => Offset(
-            (index % 20) * 32.0,
-            (index / 20) * 24.0
-          ));
-        });
-      }
-    });
-  }
-
-  void _processImage(CameraImage image) async {
+  void _processImage(CameraImage image) {
     final List<Offset> points = [];
+    final Uint8List bytes = image.planes[0].bytes;
     final int width = image.width;
     final int height = image.height;
-    const int step = 15;
+    const int step = 14;
 
-    try {
-      if (image.planes.isNotEmpty) {
-        final Uint8List bytes = image.planes[0].bytes;
-        for (int y = 0; y < height; y += step) {
-          for (int x = 0; x < width; x += step) {
-            final int pixelIndex = y * width + x;
-            if (pixelIndex < bytes.length) {
-              final int luma = bytes[pixelIndex];
-              if (luma > 110) {
-                points.add(Offset(x.toDouble(), y.toDouble()));
-              }
-            }
-          }
+    for (int y = step; y < height - step; y += step) {
+      for (int x = step; x < width - step; x += step) {
+        final int idx = y * width + x;
+
+        final int current = bytes[idx];
+        final int neighbor = bytes[idx + 1];
+        final int verticalNeighbor = bytes[idx + width];
+
+        int diff = (current - neighbor).abs() + (current - verticalNeighbor).abs();
+
+        if (diff > 25) {
+          points.add(Offset((width - x).toDouble(), y.toDouble()));
         }
       }
-    } catch (e) {
-      debugPrint("Erro no processamento: $e");
     }
 
     if (mounted) {
@@ -162,117 +113,96 @@ class _HologramHomeState extends State<HologramHome> with SingleTickerProviderSt
   @override
   void dispose() {
     _controller?.dispose();
-    _scanController.dispose();
+    _uiController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
-      body: _buildContent(),
+      backgroundColor: const Color(0xFF000814),
+      body: _buildMainLayer(),
     );
   }
 
-  Widget _buildContent() {
-    if (_errorMessage != null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.videocam_off, color: Colors.redAccent, size: 64),
-              const SizedBox(height: 16),
-              Text(
-                _errorMessage!,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white, fontSize: 16),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: () {
-                  setState(() {
-                    _errorMessage = null;
-                    _controller = null;
-                  });
-                  _initCamera();
-                },
-                child: const Text("Tentar Novamente"),
-              )
-            ],
-          ),
-        ),
-      );
-    }
-
+  Widget _buildMainLayer() {
+    if (_errorMessage != null) return _buildErrorUI();
     if (_controller == null || !_controller!.value.isInitialized) {
       return const Center(child: CircularProgressIndicator(color: Colors.cyanAccent));
     }
 
     return Stack(
       children: [
+        Positioned.fill(child: CustomPaint(painter: GridPainter())),
         Positioned.fill(
-          child: Opacity(
-            opacity: 0.1,
-            child: CameraPreview(_controller!),
-          ),
-        ),
-        Positioned.fill(
-          child: CustomPaint(
-            painter: HologramPainter(
-              points: _silhouettePoints,
-              imageSize: _imageSize,
-              scanProgress: _scanController.value,
+          child: AnimatedBuilder(
+            animation: _uiController,
+            builder: (context, child) => CustomPaint(
+              painter: NeuralHologramPainter(
+                points: _silhouettePoints,
+                imageSize: _imageSize,
+                scanProgress: _uiController.value,
+              ),
             ),
           ),
         ),
-        _buildUI(),
+        _buildHUD(),
       ],
     );
   }
 
-  Widget _buildUI() {
+  Widget _buildHUD() {
     return SafeArea(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(20.0),
-            child: Column(
-              children: [
-                Text(
-                  "TERLINET HOLOGRAMA",
-                  style: TextStyle(
-                    color: Colors.cyanAccent.withOpacity(0.8),
-                    letterSpacing: 6,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 18,
-                  ),
+      child: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _hudRow("BIOMETRIC_SCAN", "ENABLED", Colors.cyanAccent),
+            _hudRow("NEURAL_MESH", "STABLE", Colors.purpleAccent),
+            const Spacer(),
+            Center(
+              child: Text(
+                "TERLINET HOLOGRAMA",
+                style: TextStyle(
+                  color: Colors.cyanAccent.withOpacity(0.6),
+                  letterSpacing: 12,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w100,
                 ),
-                Text(
-                  "SILHOUETTE SCAN ACTIVE",
-                  style: TextStyle(
-                    color: Colors.cyanAccent.withOpacity(0.5),
-                    letterSpacing: 2,
-                    fontSize: 10,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const Spacer(),
-          Container(
-            padding: const EdgeInsets.symmetric(vertical: 20),
-            width: double.infinity,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.bottomCenter,
-                end: Alignment.topCenter,
-                colors: [Colors.cyanAccent.withOpacity(0.1), Colors.transparent],
               ),
             ),
-            child: Icon(Icons.blur_on, color: Colors.cyanAccent.withOpacity(0.6), size: 40),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _hudRow(String label, String status, Color color) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8.0),
+      child: Row(
+        children: [
+          Text("$label: ", style: const TextStyle(color: Colors.white24, fontSize: 10, fontFamily: 'monospace')),
+          Text(status, style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold, fontFamily: 'monospace')),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildErrorUI() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.videocam_off, color: Colors.redAccent, size: 40),
+          const SizedBox(height: 16),
+          Text(_errorMessage!, style: const TextStyle(color: Colors.white54, fontSize: 14)),
+          const SizedBox(height: 24),
+          OutlinedButton(
+            onPressed: () => _initCamera(),
+            style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.cyanAccent)),
+            child: const Text("RESET_CONNECTION", style: TextStyle(color: Colors.cyanAccent)),
           ),
         ],
       ),
@@ -280,54 +210,68 @@ class _HologramHomeState extends State<HologramHome> with SingleTickerProviderSt
   }
 }
 
-class HologramPainter extends CustomPainter {
+class NeuralHologramPainter extends CustomPainter {
   final List<Offset> points;
   final Size imageSize;
   final double scanProgress;
 
-  HologramPainter({
-    required this.points,
-    required this.imageSize,
-    required this.scanProgress,
-  });
+  NeuralHologramPainter({required this.points, required this.imageSize, required this.scanProgress});
 
   @override
   void paint(Canvas canvas, Size size) {
     if (points.isEmpty) return;
 
-    final paint = Paint()
-      ..color = Colors.cyanAccent
-      ..strokeCap = StrokeCap.round;
+    final paint = Paint()..strokeCap = StrokeCap.round;
+    final linePaint = Paint()..color = Colors.cyanAccent.withOpacity(0.05)..strokeWidth = 0.5;
 
-    final double scaleX = size.width / (imageSize.width == 0 ? 1 : imageSize.width);
-    final double scaleY = size.height / (imageSize.height == 0 ? 1 : imageSize.height);
+    final double scaleX = size.width / imageSize.width;
+    final double scaleY = size.height / imageSize.height;
+    final double scanY = size.height * scanProgress;
 
-    double scanLineY = size.height * scanProgress;
-
-    for (var point in points) {
-      final double scaledX = point.dx * scaleX;
-      final double scaledY = point.dy * scaleY;
-
-      double distanceToScan = (scaledY - scanLineY).abs();
-      double opacity = 0.2;
-      double radius = 1.0;
-
-      if (distanceToScan < 60) {
-        opacity = 0.8 - (distanceToScan / 60) * 0.6;
-        radius = 1.5;
+    for (int i = 0; i < points.length; i += 4) {
+      final p1 = Offset(points[i].dx * scaleX, points[i].dy * scaleY);
+      for (int j = i + 1; j < math.min(i + 5, points.length); j++) {
+        final p2 = Offset(points[j].dx * scaleX, points[j].dy * scaleY);
+        double distance = (p1 - p2).distance;
+        if (distance < 40) {
+          canvas.drawLine(p1, p2, linePaint);
+        }
       }
-
-      paint.color = Colors.cyanAccent.withOpacity(opacity);
-      canvas.drawCircle(Offset(scaledX, scaledY), radius, paint);
     }
 
-    final scanPaint = Paint()
-      ..color = Colors.cyanAccent.withOpacity(0.4)
-      ..strokeWidth = 1.0;
+    for (var p in points) {
+      final pos = Offset(p.dx * scaleX, p.dy * scaleY);
+      final distToScan = (pos.dy - scanY).abs();
 
-    canvas.drawLine(Offset(0, scanLineY), Offset(size.width, scanLineY), scanPaint);
+      if (distToScan < 60) {
+        double intensity = 1.0 - (distToScan / 60);
+        paint.color = Colors.cyanAccent.withOpacity(0.3 + (0.7 * intensity));
+        canvas.drawCircle(pos, 1.5, paint);
+      } else {
+        paint.color = Colors.cyanAccent.withOpacity(0.2);
+        canvas.drawCircle(pos, 1.0, paint);
+      }
+    }
+
+    final scanRect = Rect.fromLTWH(0, scanY, size.width, 2);
+    canvas.drawRect(scanRect, Paint()..color = Colors.cyanAccent.withOpacity(0.2));
   }
 
   @override
-  bool shouldRepaint(HologramPainter oldDelegate) => true;
+  bool shouldRepaint(NeuralHologramPainter oldDelegate) => true;
+}
+
+class GridPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.cyanAccent.withOpacity(0.02)..strokeWidth = 0.5;
+    for (double i = 0; i < size.width; i += 50) {
+      canvas.drawLine(Offset(i, 0), Offset(i, size.height), paint);
+    }
+    for (double i = 0; i < size.height; i += 50) {
+      canvas.drawLine(Offset(0, i), Offset(size.width, i), paint);
+    }
+  }
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
